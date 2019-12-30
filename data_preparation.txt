@@ -1,0 +1,168 @@
+#start hive
+beeline -u "jdbc:hive2://hador-c1.ics.muni.cz:10000/default;principal=hive/hador-c1.ics.muni.cz@ICS.MUNI.CZ"
+use kholkolg;
+
+# trip data.csv:
+# 19 columns
+# VendorID, tpep_pickup_datetime, tpep_dropoff_datetime, passenger_count, 
+# trip_distance, pickup_longitude, pickup_latitude, RatecodeID, 
+# store_and_fwd_flag, dropoff_longitude, dropoff_latitude, payment_type, 
+# fare_amount, extra, mta_tax, tip_amount,
+# tolls_amount, improvement_surcharge, total_amount
+
+# Prepare external tables
+drop table if exists nyc2015_ext;
+create external table nyc2015_ext
+(vendor int, 
+ pickup_datetime timestamp, 
+ dropoff_datetime timestamp, 
+ count int, 
+ trip_distance double, 
+ pickup_longitude double, 
+ pickup_latitude double, 
+ rate int, 
+ flag int, 
+ dropoff_longitude double, 
+ dropoff_latitude double, 
+ payment int, 
+ fare_amount double, 
+ extra double, 
+ mta_tax double, 
+ tip_amount double, 
+ tolls_amount double, 
+ improvement_surcharge double, 
+ total_amount double ) 
+row format delimited
+fields terminated by ','
+lines terminated by '\n'
+stored as textfile
+location '/user/kholkolg/nyc2015'
+tblproperties("skip.header.line.count"="1");
+
+
+
+#weather
+drop table if exists weather_ext;
+create external table weather_ext
+(datetime timestamp, 
+ temperature double, 
+ humidity double, 
+ pressure double, 
+ wind_speed double, 
+ description string)
+stored as parquet
+tblproperties("parquet.compress"="SNAPPY");
+
+
+# 2. Prepare weather data
+pyspark --master yarn --num-executors 2 --executor-memory 4G --packages com.databricks:spark-csv_2.10:1.5.0 --conf spark.ui.port=10308
+		
+from pyspark.sql import functions as fun
+from pyspark.sql import Row	
+from pyspark.sql.types import *
+from pyspark.sql.functions import col
+
+from pyspark.sql import HiveContext
+
+#prepare weather data from separate .csv files
+dates = ('2015-01-01', '2016-01-01')
+#temperature
+temp = sqlContext.read.format("com.databricks.spark.csv").\
+                  option("header", "true").option("inferSchema", "true").\
+                  load('/user/kholkolg/weather/temperature.csv')
+
+temp = temp.select('datetime', 'New York').where(fun.col('datetime').between(*dates))
+temp = temp.withColumnRenamed('New York', 'temperature')
+temp = temp.withColumn('temperature', temp['temperature'] - 272.15) #convert to Celsius
+
+#humidity
+hum = sqlContext.read.format("com.databricks.spark.csv").\
+                  option("header", "true").option("inferSchema", "true").\
+                  load('/user/kholkolg/weather/humidity.csv')
+hum = hum.select('datetime', 'New York').where(fun.col('datetime').between(*dates))
+hum = hum.withColumnRenamed('New York', 'humidity')
+
+#pressure
+pressure = sqlContext.read.format("com.databricks.spark.csv").\
+                  option("header", "true").option("inferSchema", "true").\
+                  load('/user/kholkolg/weather/pressure.csv')
+pressure = pressure.select('datetime', 'New York').where(fun.col('datetime').between(*dates))
+pressure = pressure.withColumnRenamed('New York', 'pressure')
+
+#wind speed
+wind = sqlContext.read.format("com.databricks.spark.csv").\
+                  option("header", "true").option("inferSchema", "true").\
+                  load('/user/kholkolg/weather/wind_speed.csv')
+wind = wind.select('datetime', 'New York').where(fun.col('datetime').between(*dates))
+wind = wind.withColumnRenamed('New York', 'wind_speed')
+
+#weather description
+weather = sqlContext.read.format("com.databricks.spark.csv").\
+                  option("header", "true").option("inferSchema", "true").\
+                  load('/user/kholkolg/weather/weather_description.csv')
+weather = weather.select('datetime', 'New York').where(fun.col('datetime').between(*dates))
+weather = weather.withColumnRenamed('New York', 'description')
+
+#join all dataframes and write to hive 
+weather = temp.join(hum, 'datetime').join(pressure, 'datetime').join(wind, 'datetime').join(weather, 'datetime')
+weather2015.write.mode('overwrite').saveAsTable('kholkolg.weather_ext')
+
+
+
+# 3. copy data to internal table
+set hive.exec.dynamic.partition=true; 
+set hive.exec.dynamic.partition.mode=nonstrict;
+
+# trips
+drop table if exists nyc2015_trips;
+create table nyc2015_trips
+(pickup_datetime timestamp, 
+ dropoff_datetime timestamp, 
+ count int, 
+ trip_distance double, 
+ pickup_longitude double, 
+ pickup_latitude double, 
+ dropoff_longitude double, 
+ dropoff_latitude double)
+partitioned by (month int)
+stored as orc
+tblproperties("orc.compress"="ZLIB");
+
+insert overwrite table nyc2015_trips
+partition (month)
+select pickup_datetime,
+dropoff_datetime,
+count, 
+trip_distance,
+pickup_longitude,
+pickup_latitude, 
+dropoff_longitude,
+dropoff_latitude,
+month(to_date(pickup_datetime)) month
+from nyc2015_ext;
+
+# weather
+drop table if exists weather;
+create table weather
+(datetime timestamp, 
+ temperature double, 
+ humidity double, 
+ pressure double, 
+ wind_speed double, 
+ description string)
+partitioned by (month int)
+stored as orc
+tblproperties("orc.compress"="ZLIB");
+
+insert overwrite table weather
+partition (month)
+select datetime, 
+temperature,
+humidity, 
+pressure,
+wind_speed,
+description, 
+month(to_date(datetime)) month
+from weather_ext;
+
+
